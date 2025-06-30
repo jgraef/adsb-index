@@ -1,4 +1,7 @@
-pub use crate::source::mode_s::cpr::decode::decode_globally_unambigious;
+pub use crate::source::mode_s::cpr::decode::{
+    decode_globally_unambigious,
+    decode_locally_umambiguous,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CprFormat {

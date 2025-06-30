@@ -588,7 +588,7 @@ impl Debug for InterrogatorReservationType {
     }
 }
 
-/// 13-bit altitude code
+/// 13-bit altitude / Mode C code
 ///
 /// <https://mode-s.org/1090mhz/content/mode-s/3-surveillance.html>
 /// <http://www.aeroelectric.com/articles/Altitude_Encoding/modec.htm>
@@ -690,7 +690,7 @@ impl AltitudeUnit {
     }
 }
 
-/// 13-bit identity code
+/// 13-bit identity / Mode A code
 /// <https://mode-s.org/1090mhz/content/mode-s/3-surveillance.html>
 /// <http://www.aeroelectric.com/articles/Altitude_Encoding/modec.htm>
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

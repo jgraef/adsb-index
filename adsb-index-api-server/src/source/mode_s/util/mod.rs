@@ -90,13 +90,14 @@ pub fn decode_air_air_surveillance_common_fields(
 ///
 /// This is useful for decoding surveillance replies and air air surveillance
 /// frames.
-fn decode_frame_aligned_altitude_or_identity_code(bytes: &[u8]) -> u16 {
+pub(super) fn decode_frame_aligned_altitude_or_identity_code(bytes: &[u8]) -> u16 {
     (u16::from(bytes[0] & 0b00011111) << 8) | u16::from(bytes[1])
 }
 
 /// Decode CPR from a frame.
 ///
-/// This expects the CPR latitude and longitude to start in `bytes[0]`` bit 6
+/// This expects the CPR latitude and longitude to start at bit 6 in `bytes[0]`.
+/// A total of 5 bytes are required.
 ///
 /// ```plain
 /// byte         0        1        2        3        4

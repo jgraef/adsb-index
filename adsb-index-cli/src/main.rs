@@ -19,7 +19,10 @@ use adsb_index_api_server::{
         sbs,
         tar1090_db::update_aircraft_db,
     },
-    tracker::Tracker,
+    tracker::{
+        Tracker,
+        state::State,
+    },
 };
 use adsb_index_api_types::{
     IcaoAddress,
@@ -27,6 +30,7 @@ use adsb_index_api_types::{
     flights::AircraftQuery,
     live::SubscriptionFilter,
 };
+use chrono::Utc;
 use clap::{
     Parser,
     Subcommand,
@@ -110,22 +114,32 @@ async fn main() -> Result<(), Error> {
             .await?;
         }
         Command::BeastClient(args) => {
-            //let mut state = State::default();
+            let mut state = State::default();
 
-            fn handle_data(data: &[u8]) {
+            fn handle_data(state: &mut State, data: &[u8]) {
                 //println!("length: {}", data.len());
 
                 //let deku_frame = adsb_deku::Frame::from_bytes(data).unwrap();
 
                 let modes_frame = mode_s::Frame::decode(&mut &data[..]).unwrap();
-                println!("modes: {modes_frame:#?}");
+                state.update_with_mode_s(Utc::now(), &modes_frame);
+                match &modes_frame {
+                    mode_s::Frame::MilitaryExtendedSquitter(_military_extended_squitter) => {
+                        println!("military: {modes_frame:#?}");
+                    }
+                    _ => {}
+                }
             }
 
             args.run(beast::output::Reader::new, |_i, packet| {
                 match packet {
                     beast::output::OutputPacket::ModeAc { .. } => {}
-                    beast::output::OutputPacket::ModeSLong { data, .. } => handle_data(&data),
-                    beast::output::OutputPacket::ModeSShort { data, .. } => handle_data(&data),
+                    beast::output::OutputPacket::ModeSLong { data, .. } => {
+                        handle_data(&mut state, &data)
+                    }
+                    beast::output::OutputPacket::ModeSShort { data, .. } => {
+                        handle_data(&mut state, &data)
+                    }
                     _ => todo!("{packet:?}"),
                 }
             })

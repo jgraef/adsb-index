@@ -1,8 +1,13 @@
 use std::{
     f64::consts::TAU,
-    fmt::Debug,
+    fmt::{
+        Debug,
+        Display,
+    },
+    str::FromStr,
 };
 
+use adsb_index_api_types::Squawk;
 use bytes::Buf;
 
 use crate::{
@@ -13,7 +18,11 @@ use crate::{
             Cpr,
             CprFormat,
         },
-        util::decode_frame_aligned_encoded_position,
+        util::{
+            decode_frame_aligned_altitude_or_identity_code,
+            decode_frame_aligned_encoded_position,
+            gillham::decode_gillham_id13,
+        },
     },
     util::BufReadBytesExt,
 };
@@ -26,14 +35,15 @@ pub enum Message {
     SurfacePosition(SurfacePosition),
     AirbornePosition(AirbornePosition),
     AirborneVelocity(AirborneVelocity),
-    TestMessage([u8; 7]),
-    SurfaceSystemMessage([u8; 7]),
+    TestMessage([u8; 6]),
+    SurfaceSystemMessage(SurfaceSystemMessage),
     AircraftStatus(AircraftStatus),
     TargetStateAndStatusInformation(TargetStateAndStatusInformation),
+    AircraftOperationalStatus(AircraftOperationalStatus),
     Reserved {
         type_code: u8,
         sub_type: u8,
-        data: [u8; 7],
+        data: [u8; 6],
     },
 }
 
@@ -43,7 +53,10 @@ impl Message {
         let type_code = byte_0 >> 3;
         let bits_6_to_8 = byte_0 & 0b111; // subtype code for some type codes
 
+        tracing::debug!(?type_code, sub_type = ?bits_6_to_8, "decoding adsb-b message");
+
         let reserved = |buffer: &mut B| {
+            tracing::debug!(?type_code, sub_type = ?bits_6_to_8, "reserved adsb-b message");
             Self::Reserved {
                 type_code,
                 sub_type: bits_6_to_8,
@@ -69,7 +82,7 @@ impl Message {
             }
             19 => {
                 match bits_6_to_8 {
-                    1..=4 => Self::AirborneVelocity(AirborneVelocity::decode(buffer, bits_6_to_8)?),
+                    1..=4 => Self::AirborneVelocity(AirborneVelocity::decode(buffer, bits_6_to_8)),
                     _ => reserved(buffer),
                 }
             }
@@ -79,19 +92,26 @@ impl Message {
                     _ => reserved(buffer),
                 }
             }
-            24 => {
-                match bits_6_to_8 {
-                    1 => Self::SurfaceSystemMessage(buffer.get_bytes()),
+            24 => Self::SurfaceSystemMessage(SurfaceSystemMessage::decode(buffer, bits_6_to_8)),
+            27 => todo!("reserved for trajectory change message"),
+            28 => Self::AircraftStatus(AircraftStatus::decode(buffer, bits_6_to_8)),
+            29 => {
+                // rare 2-bit sub type
+                let sub_type = bits_6_to_8 >> 1;
+                match sub_type {
+                    1 => {
+                        Self::TargetStateAndStatusInformation(
+                            TargetStateAndStatusInformation::decode(buffer, bits_6_to_8 & 1 != 0),
+                        )
+                    }
                     _ => reserved(buffer),
                 }
             }
-            27 => todo!("reserved for trajectory change message"),
-            28 => Self::AircraftStatus(AircraftStatus::decode(buffer, bits_6_to_8)?),
-            29 => {
-                Self::TargetStateAndStatusInformation(TargetStateAndStatusInformation::decode(
+            31 => {
+                Self::AircraftOperationalStatus(AircraftOperationalStatus::decode(
                     buffer,
                     bits_6_to_8,
-                )?)
+                ))
             }
             _ => reserved(buffer),
         };
@@ -164,9 +184,9 @@ pub struct AirbornePosition {
 impl AirbornePosition {
     pub fn decode<B: Buf>(buffer: &mut B, type_code: u8, bits_6_to_8: u8) -> Self {
         let bytes: [u8; 6] = buffer.get_bytes();
-        let (cpr_format, cpr_position) = decode_frame_aligned_encoded_position(&bytes[2..]);
+        let (cpr_format, cpr_position) = decode_frame_aligned_encoded_position(&bytes[1..]);
         Self {
-            //        0        1        2        3        4        5        6
+            //       -1        0        1        2        3        4        5
             // tttttssS aaaaaaaa aaaaTFll llllllll lllllllL LLLLLLLL LLLLLLLL
             altitude_type: AltitudeType::from_type_code(type_code),
             surveillance_status: SurveillanceStatus(bits_6_to_8 >> 1),
@@ -176,6 +196,10 @@ impl AirbornePosition {
             cpr_format,
             cpr_position,
         }
+    }
+
+    pub fn altitude(&self) -> Option<DecodedAltitude> {
+        self.encoded_altitude.decode(self.altitude_type)
     }
 }
 
@@ -194,7 +218,7 @@ pub struct AirborneVelocity {
 }
 
 impl AirborneVelocity {
-    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Result<Self, DecodeError> {
+    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Self {
         let sub_type = bits_6_to_8;
         let supersonic = sub_type == 3 || sub_type == 4;
         let bytes: [u8; 6] = buffer.get_bytes();
@@ -317,7 +341,7 @@ impl AirborneVelocity {
             value: altitude_difference_value,
         };
 
-        Ok(Self {
+        Self {
             supersonic,
             intent_change_flag,
             ifr_capability_flag,
@@ -326,264 +350,246 @@ impl AirborneVelocity {
             vertical_rate,
             turn_indicator,
             altitude_difference,
-        })
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VelocityType {
-    GroundSpeed(GroundSpeed),
-    Airspeed(Airspeed),
+pub enum AircraftStatus {
+    EmergencyPriorityStatusAndModeACode(EmergencyPriorityStatusAndModeACode),
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GroundSpeed {
-    pub direction_east_west: DirectionEastWest,
-    pub velocity_east_west: Option<Velocity>,
-    pub direction_north_south: DirectionNorthSouth,
-    pub velocity_north_south: Option<Velocity>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DirectionNorthSouth {
-    SouthToNorth,
-    NorthToSouth,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DirectionEastWest {
-    WestToEast,
-    EastToWest,
-}
-
-/// A 10-bit velocity value.
-///
-/// This is used for east-west and north-south ground speed in [`GroundSpeed`]
-/// and for the airspeed in [`Airspeed`]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Velocity(u16);
-
-impl Velocity {
-    pub const fn from_u16_unchecked(word: u16) -> Self {
-        Self(word)
-    }
-
-    pub const fn from_u16(word: u16) -> Option<Self> {
-        if word & 0b1111110000000000 == 0 && word != 0 {
-            Some(Self(word))
-        }
-        else {
-            None
-        }
-    }
-
-    pub fn as_u16(&self) -> u16 {
-        self.0
-    }
-
-    pub fn as_knots(&self, supersonic: bool) -> u16 {
-        let v = self.0 - 1;
-        let v = if supersonic { v * 4 } else { v };
-        v
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Airspeed {
-    magnetic_heading: Option<MagneticHeading>,
-    airspeed_type: AirspeedType,
-    airspeed_value: Option<Velocity>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MagneticHeading(u16);
-
-impl MagneticHeading {
-    pub const fn from_u16_unchecked(word: u16) -> Self {
-        Self(word)
-    }
-
-    pub const fn from_u16(word: u16) -> Option<Self> {
-        if word & 0b1111110000000000 == 0 {
-            Some(Self(word))
-        }
-        else {
-            None
-        }
-    }
-
-    /// The magnetic heading as 360/1024 of a degree
-    pub fn as_u16(&self) -> u16 {
-        self.0
-    }
-
-    pub fn as_degrees(&self) -> f64 {
-        self.0 as f64 * 360.0 / 1024.0
-    }
-
-    pub fn as_radians(&self) -> f64 {
-        self.0 as f64 * TAU / 1024.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AirspeedType {
-    Indicated,
-    True,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VerticalRate {
-    pub source: VerticalRateSource,
-    pub sign: VerticalRateSign,
-    pub value: Option<VerticalRateValue>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum VerticalRateSource {
-    Barometric,
-    Gnss,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum VerticalRateSign {
-    Up,
-    Down,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VerticalRateValue(u16);
-
-impl VerticalRateValue {
-    pub const fn from_u16_unchecked(word: u16) -> Self {
-        Self(word)
-    }
-
-    pub const fn from_u16(word: u16) -> Option<Self> {
-        if word & 0b1111111000000000 == 0 && word != 0 {
-            Some(Self(word))
-        }
-        else {
-            None
-        }
-    }
-
-    /// The magnetic heading as 360/1024 of a degree
-    pub fn as_u16(&self) -> u16 {
-        self.0
-    }
-
-    pub fn as_ft_per_min(&self) -> u16 {
-        (self.0 - 1) * 64
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AltitudeDifferenceSign {
-    GnssAboveBarometric,
-    GnssBelowBarometric,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AltitudeDifferenceValue(u8);
-
-impl AltitudeDifferenceValue {
-    pub const fn from_u8_unchecked(byte: u8) -> Self {
-        Self(byte)
-    }
-
-    pub const fn from_u8(byte: u8) -> Option<Self> {
-        if byte & 0b10000000 == 0 && byte != 0 {
-            Some(Self(byte))
-        }
-        else {
-            None
-        }
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        self.0
-    }
-
-    pub fn as_ft(&self) -> u8 {
-        (self.0 - 1) * 23
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AltitudeDifference {
-    pub sign: AltitudeDifferenceSign,
-    pub value: Option<AltitudeDifferenceValue>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NavigationUncertaintyCategory(u8);
-
-impl NavigationUncertaintyCategory {
-    pub const fn from_u8_unchecked(byte: u8) -> Self {
-        Self(byte)
-    }
-
-    pub const fn from_u8(byte: u8) -> Option<Self> {
-        if byte & 0b11111000 == 0 && byte != 0 {
-            Some(Self(byte))
-        }
-        else {
-            None
-        }
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        self.0
-    }
-}
-
-
-
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TurnIndicator(u8);
-
-impl TurnIndicator {
-    pub const fn from_u8_unchecked(byte: u8) -> Self {
-        Self(byte)
-    }
-
-    pub const fn from_u8(byte: u8) -> Option<Self> {
-        if byte & 0b11111000 == 0 && byte != 0 {
-            Some(Self(byte))
-        }
-        else {
-            None
-        }
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        self.0
-    }
-}
-
-
-
-
-
-
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AircraftStatus {}
 
 impl AircraftStatus {
-    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Result<Self, DecodeError> {
-        todo!();
+    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Self {
+        let sub_type = bits_6_to_8;
+
+        match sub_type {
+            1 => {
+                // tttttsss eeeiiiii iiiiiiii
+                let bytes: [u8; 2] = buffer.get_bytes();
+                Self::EmergencyPriorityStatusAndModeACode(EmergencyPriorityStatusAndModeACode {
+                    emergency_priority_status: EmergencyPriorityStatus(bytes[0] >> 5),
+                    mode_a_code: {
+                        // todo: should this include the ident bit? or should it always be zero?
+                        // (page 139). i think it should be the latter.
+                        Squawk::from_u16_unchecked(decode_gillham_id13(
+                            decode_frame_aligned_altitude_or_identity_code(&bytes[..]),
+                        ))
+                    },
+                    reserved: buffer.get_u32(),
+                })
+            }
+            2 => {
+                todo!("1090ES TCAS Resolution Advisory (RA) Broadcast Message (Subtype=2)")
+            }
+            _ => todo!(),
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TargetStateAndStatusInformation {}
+pub struct EmergencyPriorityStatusAndModeACode {
+    pub emergency_priority_status: EmergencyPriorityStatus,
+    pub mode_a_code: Squawk,
+    pub reserved: u32,
+}
+
+impl EmergencyPriorityStatusAndModeACode {
+    pub fn from_squawk(squawk: Squawk) -> Self {
+        Self {
+            emergency_priority_status: EmergencyPriorityStatus::from_squawk(squawk)
+                .unwrap_or_default(),
+            mode_a_code: squawk,
+            reserved: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EmergencyPriorityStatus(u8);
+
+impl EmergencyPriorityStatus {
+    pub const NO_EMERGENCY: Self = Self(0);
+    pub const GENERAL_EMERGENCY: Self = Self(1);
+    pub const LIFEGUARD_MEDICAL_EMERGENCY: Self = Self(2);
+    pub const MINIMAL_FUEL: Self = Self(3);
+    pub const NO_COMMUNICATIONS: Self = Self(4);
+    pub const UNLAWFUL_INTERFERENCE: Self = Self(5);
+    pub const DOWNED_AIRCRAFT: Self = Self(6);
+
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b11111000 == 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+
+    pub fn is_emergency(&self) -> bool {
+        *self != Self::NO_EMERGENCY
+    }
+
+    /// Returns the emergency priority status that shall be set for a given Mode
+    /// A code (squawk).
+    ///
+    /// See 2.2.3.2.7.8.1.1 (page 138)
+    pub fn from_squawk(squawk: Squawk) -> Option<Self> {
+        match squawk {
+            Squawk::AIRCRAFT_HIJACKING => Some(Self::UNLAWFUL_INTERFERENCE),
+            Squawk::RADIO_FAILURE => Some(Self::NO_COMMUNICATIONS),
+            Squawk::EMERGENCY => Some(Self::GENERAL_EMERGENCY),
+            _ => None,
+        }
+    }
+}
+
+impl Default for EmergencyPriorityStatus {
+    fn default() -> Self {
+        Self::NO_EMERGENCY
+    }
+}
+
+impl Debug for EmergencyPriorityStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::NO_EMERGENCY => write!(f, "EmergencyPriorityStatus::NO_EMERGENCY"),
+            Self::GENERAL_EMERGENCY => write!(f, "EmergencyPriorityStatus::GENERAL_EMERGENCY"),
+            Self::LIFEGUARD_MEDICAL_EMERGENCY => {
+                write!(f, "EmergencyPriorityStatus::LIFEGUARD_MEDICAL_EMERGENCY")
+            }
+            Self::MINIMAL_FUEL => write!(f, "EmergencyPriorityStatus::MINIMAL_FUEL"),
+            Self::NO_COMMUNICATIONS => write!(f, "EmergencyPriorityStatus::NO_COMMUNICATIONS"),
+            Self::UNLAWFUL_INTERFERENCE => {
+                write!(f, "EmergencyPriorityStatus::UNLAWFUL_INTERFERENCE")
+            }
+            Self::DOWNED_AIRCRAFT => write!(f, "EmergencyPriorityStatus::DOWNED_AIRCRAFT"),
+            _ => write!(f, "EmergencyPriorityStatus({})", self.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetStateAndStatusInformation {
+    pub sil_supplement: SilSupplement,
+    pub selected_altitude_type: SelectedAltitudeType,
+    //pub navigation_accuracy_category_position: NavigationAccuracyCategoryPosition,
+    /// Feel free to open a pull request :3
+    pub todo: (),
+}
 
 impl TargetStateAndStatusInformation {
-    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Result<Self, DecodeError> {
-        todo!();
+    pub fn decode<B: Buf>(buffer: &mut B, bit_8: bool) -> Self {
+        // page 106
+        let sil_supplement = if bit_8 {
+            SilSupplement::PerSample
+        }
+        else {
+            SilSupplement::PerHour
+        };
+        let bytes: [u8; 6] = buffer.get_bytes();
+        let selected_altitude_type = if bytes[0] & 0b1000000 == 0 {
+            SelectedAltitudeType::Fms
+        }
+        else {
+            SelectedAltitudeType::McpFcu
+        };
+
+        // todo
+        Self {
+            sil_supplement,
+            selected_altitude_type,
+            todo: (),
+        }
+    }
+}
+
+/// Probability of exceeding NIC radius of containment is based on
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SilSupplement {
+    PerHour,
+    PerSample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SelectedAltitudeType {
+    McpFcu,
+    Fms,
+}
+
+/// Aircraft Operational Status ADS-B Message
+///
+/// type=31, page 116
+///
+/// todo: there's a ADS-B version in here, other good info too :)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AircraftOperationalStatus {
+    Airborne {
+        /// Feel free to open a PR
+        todo: (),
+        // todo airborne participants
+    },
+    Surface {
+        /// Feel free to open a PR
+        todo: (),
+        // todo surface participants
+    },
+    Reserved {
+        sub_type: u8,
+        data: [u8; 6],
+    },
+}
+
+impl AircraftOperationalStatus {
+    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Self {
+        let sub_type = bits_6_to_8;
+
+        match sub_type {
+            0 => {
+                Self::Airborne { todo: () }
+                //todo!("airborne")
+            }
+            1 => {
+                Self::Surface { todo: () }
+                //todo!("surface")
+            }
+            _ => {
+                Self::Reserved {
+                    sub_type,
+                    data: buffer.get_bytes(),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceSystemMessage {
+    Reserved { sub_type: u8, data: [u8; 6] },
+    MultilaterationSystemStatus([u8; 6]),
+}
+
+impl SurfaceSystemMessage {
+    pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Self {
+        let sub_type = bits_6_to_8;
+
+        match sub_type {
+            1 => Self::MultilaterationSystemStatus(buffer.get_bytes()),
+            _ => {
+                Self::Reserved {
+                    sub_type,
+                    data: buffer.get_bytes(),
+                }
+            }
+        }
     }
 }
 
@@ -652,14 +658,15 @@ impl WakeVortexCategory {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Callsign {
     // note: we verified that this is valid ascii, and thus we can also create utf-8 strs from it.
-    characters: [u8; 8],
-    trimmed: [u8; 2],
+    characters: [u8; Self::LENGTH],
 }
 
 impl Callsign {
+    pub const LENGTH: usize = 8;
+
     pub fn from_bytes(bytes: [u8; 6]) -> Result<Self, DecodeError> {
         // byte 0        1        2        3        4        5
         // bit  01234567 01234567 01234567 01234567 01234567 01234567
@@ -677,12 +684,8 @@ impl Callsign {
             (bytes[5] & 0b111111),
         ];
 
-        let mut first_non_space = 0;
-        let mut last_non_space = 0;
-        let mut saw_non_space = false;
-
         // resolve to ascii character
-        for (i, byte) in expanded.iter_mut().enumerate() {
+        for byte in &mut expanded {
             let resolved = CALLSIGN_ENCODING[*byte as usize];
 
             if resolved == b'#' {
@@ -692,20 +695,11 @@ impl Callsign {
                 });
             }
 
-            if resolved != b' ' {
-                last_non_space = i;
-                if !saw_non_space {
-                    first_non_space = i;
-                }
-                saw_non_space = true;
-            }
-
             *byte = resolved;
         }
 
         Ok(Self {
             characters: expanded,
-            trimmed: [first_non_space as u8, last_non_space as u8],
         })
     }
 
@@ -715,9 +709,69 @@ impl Callsign {
     }
 }
 
+impl Debug for Callsign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Callsign").field(&self.as_str()).finish()
+    }
+}
+
+impl Display for Callsign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for Callsign {
+    type Err = InvalidCallsign;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let n = s.len();
+        if n > Self::LENGTH {
+            return Err(InvalidCallsign::InvalidLength(n));
+        }
+
+        let mut characters = [0u8; Self::LENGTH];
+        for (i, c) in s.chars().enumerate() {
+            if !valid_callsign_char(c) {
+                return Err(InvalidCallsign::InvalidChar {
+                    position: i,
+                    character: c,
+                });
+            }
+            characters[i] = c.try_into().unwrap();
+        }
+
+        Ok(Self { characters })
+    }
+}
+
+impl AsRef<[u8]> for Callsign {
+    fn as_ref(&self) -> &[u8] {
+        &self.characters[..]
+    }
+}
+
+impl AsRef<[u8; Self::LENGTH]> for Callsign {
+    fn as_ref(&self) -> &[u8; Self::LENGTH] {
+        &self.characters
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum InvalidCallsign {
+    #[error("Invalid character in callsign: '{character}' at position {position}")]
+    InvalidChar { position: usize, character: char },
+    #[error("Invalid length for callsign: {0}")]
+    InvalidLength(usize),
+}
+
 /// <https://mode-s.org/1090mhz/content/ads-b/2-identification.html>
 pub const CALLSIGN_ENCODING: &'static [u8] =
     b"#ABCDEFGHIJKLMNOPQRSTUVWXYZ##### ###############0123456789######";
+
+pub fn valid_callsign_char(c: char) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' '
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Movement(u8);
@@ -990,5 +1044,259 @@ impl DecodedAltitude {
             AltitudeType::Barometric => AltitudeUnit::Feet,
             AltitudeType::Gnss => AltitudeUnit::Meter,
         }
+    }
+
+    pub fn as_meter(&self) -> f64 {
+        let a = self.altitude as f64;
+        match self.altitude_type {
+            AltitudeType::Barometric => 0.3048 * a,
+            AltitudeType::Gnss => a,
+        }
+    }
+
+    pub fn as_ft(&self) -> f64 {
+        let a = self.altitude as f64;
+        match self.altitude_type {
+            AltitudeType::Barometric => a,
+            AltitudeType::Gnss => 3.28084 * a,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VelocityType {
+    GroundSpeed(GroundSpeed),
+    Airspeed(Airspeed),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroundSpeed {
+    pub direction_east_west: DirectionEastWest,
+    pub velocity_east_west: Option<Velocity>,
+    pub direction_north_south: DirectionNorthSouth,
+    pub velocity_north_south: Option<Velocity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DirectionNorthSouth {
+    SouthToNorth,
+    NorthToSouth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DirectionEastWest {
+    WestToEast,
+    EastToWest,
+}
+
+/// A 10-bit velocity value.
+///
+/// This is used for east-west and north-south ground speed in [`GroundSpeed`]
+/// and for the airspeed in [`Airspeed`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Velocity(u16);
+
+impl Velocity {
+    pub const fn from_u16_unchecked(word: u16) -> Self {
+        Self(word)
+    }
+
+    pub const fn from_u16(word: u16) -> Option<Self> {
+        if word & 0b1111110000000000 == 0 && word != 0 {
+            Some(Self(word))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    pub fn as_knots(&self, supersonic: bool) -> u16 {
+        let v = self.0 - 1;
+        let v = if supersonic { v * 4 } else { v };
+        v
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Airspeed {
+    magnetic_heading: Option<MagneticHeading>,
+    airspeed_type: AirspeedType,
+    airspeed_value: Option<Velocity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MagneticHeading(u16);
+
+impl MagneticHeading {
+    pub const fn from_u16_unchecked(word: u16) -> Self {
+        Self(word)
+    }
+
+    pub const fn from_u16(word: u16) -> Option<Self> {
+        if word & 0b1111110000000000 == 0 {
+            Some(Self(word))
+        }
+        else {
+            None
+        }
+    }
+
+    /// Magnetic heading as 360/1024 of a degree
+    ///
+    /// Clockwise from true magnetic north.
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    /// Magnetic heading in degrees
+    ///
+    /// Clockwise from true magnetic north.
+    pub fn as_degrees(&self) -> f64 {
+        self.0 as f64 * 360.0 / 1024.0
+    }
+
+    /// Magnetic heading in radians
+    ///
+    /// Clockwise from true magnetic north.
+    pub fn as_radians(&self) -> f64 {
+        self.0 as f64 * TAU / 1024.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AirspeedType {
+    Indicated,
+    True,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VerticalRate {
+    pub source: VerticalRateSource,
+    pub sign: VerticalRateSign,
+    pub value: Option<VerticalRateValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VerticalRateSource {
+    Barometric,
+    Gnss,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VerticalRateSign {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VerticalRateValue(u16);
+
+impl VerticalRateValue {
+    pub const fn from_u16_unchecked(word: u16) -> Self {
+        Self(word)
+    }
+
+    pub const fn from_u16(word: u16) -> Option<Self> {
+        if word & 0b1111111000000000 == 0 && word != 0 {
+            Some(Self(word))
+        }
+        else {
+            None
+        }
+    }
+
+    /// The magnetic heading as 360/1024 of a degree
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    pub fn as_ft_per_min(&self) -> u16 {
+        (self.0 - 1) * 64
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AltitudeDifferenceSign {
+    GnssAboveBarometric,
+    GnssBelowBarometric,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AltitudeDifferenceValue(u8);
+
+impl AltitudeDifferenceValue {
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b10000000 == 0 && byte != 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+
+    pub fn as_ft(&self) -> u8 {
+        (self.0 - 1) * 25
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AltitudeDifference {
+    pub sign: AltitudeDifferenceSign,
+    pub value: Option<AltitudeDifferenceValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NavigationUncertaintyCategory(u8);
+
+impl NavigationUncertaintyCategory {
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b11111000 == 0 && byte != 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TurnIndicator(u8);
+
+impl TurnIndicator {
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b11111000 == 0 && byte != 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
     }
 }
