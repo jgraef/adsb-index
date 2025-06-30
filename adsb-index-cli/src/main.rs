@@ -114,52 +114,11 @@ async fn main() -> Result<(), Error> {
 
             fn handle_data(data: &[u8]) {
                 //println!("length: {}", data.len());
-                let deku_frame = adsb_deku::Frame::from_bytes(data).unwrap();
 
-                let deku_ac13 = match &deku_frame.df {
-                    adsb_deku::DF::ShortAirAirSurveillance { altitude, .. } => Some(*altitude),
-                    adsb_deku::DF::LongAirAir { altitude, .. } => Some(*altitude),
-                    adsb_deku::DF::CommBAltitudeReply { alt, .. } => Some(*alt),
-                    adsb_deku::DF::SurveillanceAltitudeReply { ac, .. } => Some(*ac),
-                    _ => None,
-                };
+                //let deku_frame = adsb_deku::Frame::from_bytes(data).unwrap();
 
-                let Ok(modes_frame) = mode_s::Frame::decode(&mut &data[..])
-                else {
-                    return;
-                };
-                let modes_ac13 = match &modes_frame {
-                    mode_s::Frame::ShortAirAirSurveillance(mode_s::ShortAirAirSurveillance {
-                        altitude_code,
-                        ..
-                    }) => Some(*altitude_code),
-                    mode_s::Frame::SurveillanceAltitudeReply(
-                        mode_s::SurveillanceAltitudeReply { altitude_code, .. },
-                    ) => Some(*altitude_code),
-                    mode_s::Frame::CommBAltitudeReply(mode_s::CommBAltitudeReply {
-                        altitude_code,
-                        ..
-                    }) => Some(*altitude_code),
-                    _ => None,
-                };
-
-                match (deku_ac13, modes_ac13) {
-                    (Some(deku_ac13), Some(modes_ac13)) => {
-                        //println!("ac13 code: 0x{:04x} decoded: 0x{:04x}", modes_ac13.as_u16(),
-                        // decode_gillham_ac13(modes_ac13.as_u16()));
-                        // println!("deku: {deku_ac13:?}");
-                        //println!();
-                        println!("{}, {}", modes_ac13.as_u16(), deku_ac13.0);
-                    }
-                    (None, None) => {}
-                    _ => {
-                        println!("deku: {deku_frame:#?}");
-                        println!("modes: {modes_frame:#?}");
-                        panic!("different frames decoded")
-                    }
-                }
-
-                //println!("modes: {modes_frame:#?}");
+                let modes_frame = mode_s::Frame::decode(&mut &data[..]).unwrap();
+                println!("modes: {modes_frame:#?}");
             }
 
             args.run(beast::output::Reader::new, |_i, packet| {

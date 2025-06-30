@@ -125,8 +125,7 @@ impl Frame {
                 Self::LongAirAirSurveillance(LongAirAirSurveillance::decode(buffer, bits_6_to_8))
             }
             DownlinkFormat::ExtendedSquitter => {
-                //Self::ExtendedSquitter(ExtendedSquitter::decode(buffer, bits_6_to_8)?)
-                return Err(DecodeError::Todo);
+                Self::ExtendedSquitter(ExtendedSquitter::decode(buffer, bits_6_to_8)?)
             }
             DownlinkFormat::ExtendedSquitterNonTransponder => {
                 Self::ExtendedSquitterNonTransponder(ExtendedSquitterNonTransponder::decode(
@@ -146,7 +145,10 @@ impl Frame {
             DownlinkFormat::CommBIdentityReply => {
                 Self::CommBIdentityReply(CommBIdentityReply::decode(buffer, bits_6_to_8))
             }
-            DownlinkFormat::CommD => return Err(DecodeError::Todo),
+            DownlinkFormat::CommD => {
+                // todo
+                Self::CommD(CommD)
+            }
         };
 
         Ok(frame)

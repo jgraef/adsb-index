@@ -1,4 +1,7 @@
-use std::fmt::Debug;
+use std::{
+    f64::consts::TAU,
+    fmt::Debug,
+};
 
 use bytes::Buf;
 
@@ -121,7 +124,7 @@ impl AircraftIdentification {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfacePosition {
-    pub ground_speed: GroundSpeed,
+    pub ground_speed: Movement,
     pub ground_track: Option<GroundTrack>,
     pub time: bool,
     pub cpr_format: CprFormat,
@@ -129,11 +132,11 @@ pub struct SurfacePosition {
 }
 
 impl SurfacePosition {
-    pub fn decode<B: Buf>(buffer: &mut B, type_code: u8, bits_6_to_8: u8) -> Self {
+    pub fn decode<B: Buf>(buffer: &mut B, _type_code: u8, bits_6_to_8: u8) -> Self {
         let bytes: [u8; 6] = buffer.get_bytes();
         let (cpr_format, cpr_position) = decode_frame_aligned_encoded_position(&bytes[1..]);
         Self {
-            ground_speed: GroundSpeed((bits_6_to_8 << 4) | (bytes[0] >> 4)),
+            ground_speed: Movement((bits_6_to_8 << 4) | (bytes[0] >> 4)),
             ground_track: if bytes[0] & 0b00001000 == 0 {
                 None
             }
@@ -177,20 +180,394 @@ impl AirbornePosition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AirborneVelocity {}
+pub struct AirborneVelocity {
+    pub supersonic: bool,
+    pub intent_change_flag: bool,
+    /// deprecated
+    pub ifr_capability_flag: bool,
+    pub navigation_uncertainty_category: NavigationUncertaintyCategory,
+    pub velocity_type: VelocityType,
+    pub vertical_rate: VerticalRate,
+    /// deprecated
+    pub turn_indicator: TurnIndicator,
+    pub altitude_difference: AltitudeDifference,
+}
 
 impl AirborneVelocity {
     pub fn decode<B: Buf>(buffer: &mut B, bits_6_to_8: u8) -> Result<Self, DecodeError> {
         let sub_type = bits_6_to_8;
+        let supersonic = sub_type == 3 || sub_type == 4;
+        let bytes: [u8; 6] = buffer.get_bytes();
 
-        let byte_0 = buffer.get_u8();
+        // byte               0        1        2        3        4        5
+        // bit         01234567 01234567 01234567 01234567 01234567 01234567
+        // field       abcccdee eeeeeeee fggggggg ggghijjj jjjjjjkk lmmmmmmm
 
-        let intent_change_flag = byte_0 & 0b10000000 != 0;
-        let ifr_capability_flag = byte_0 & 0b01000000 != 0;
+        // a
+        let intent_change_flag = bytes[0] & 0b10000000 != 0;
+        // b
+        let ifr_capability_flag = bytes[0] & 0b01000000 != 0;
+        // c
+        let navigation_uncertainty_category =
+            NavigationUncertaintyCategory((bytes[0] & 0b00111000) >> 3);
 
-        todo!();
+        // decode d, e, f, g now, because we need them for both subtypes
+        let d = bytes[0] & 0b00000100 != 0;
+        let e = (u16::from(bytes[0] & 0b11000000) << 8) | u16::from(bytes[1]);
+        let f = bytes[2] & 0b1000000 != 0;
+        let g = (u16::from(bytes[2] & 0b01111111) << 3) | u16::from(bytes[3] >> 5);
+        let velocity = |v| (v != 0).then(|| Velocity(v));
+
+        // sub-type specific
+        let velocity_type = match sub_type {
+            1 | 2 => {
+                // ground speed
+
+                // d
+                let direction_east_west = if d {
+                    DirectionEastWest::EastToWest
+                }
+                else {
+                    DirectionEastWest::WestToEast
+                };
+                // e
+                let velocity_east_west = velocity(e);
+
+                // f
+                let direction_north_south = if f {
+                    DirectionNorthSouth::NorthToSouth
+                }
+                else {
+                    DirectionNorthSouth::SouthToNorth
+                };
+                // g
+                let velocity_north_south = velocity(g);
+
+                VelocityType::GroundSpeed(GroundSpeed {
+                    direction_east_west,
+                    velocity_east_west,
+                    direction_north_south,
+                    velocity_north_south,
+                })
+            }
+            3 | 4 => {
+                // airspeed
+
+                let magnetic_heading = d.then(|| MagneticHeading(e));
+                let airspeed_type = if f {
+                    AirspeedType::True
+                }
+                else {
+                    AirspeedType::Indicated
+                };
+                let airspeed_value = velocity(g);
+
+                VelocityType::Airspeed(Airspeed {
+                    magnetic_heading,
+                    airspeed_type,
+                    airspeed_value,
+                })
+            }
+            _ => panic!("Invalid sub type for AirborneVelocity: {}", sub_type),
+        };
+
+        // h
+        let vertical_rate_source = if bytes[3] & 0b00010000 == 0 {
+            VerticalRateSource::Gnss
+        }
+        else {
+            VerticalRateSource::Barometric
+        };
+
+        // i
+        let vertical_rate_sign = if bytes[3] & 0b00001000 == 0 {
+            VerticalRateSign::Up
+        }
+        else {
+            VerticalRateSign::Down
+        };
+
+        // j
+        let j = (u16::from(bytes[3]) << 6) | u16::from(bytes[4] >> 2);
+        let vertical_rate_value = (j != 0).then(|| VerticalRateValue(j));
+
+        let vertical_rate = VerticalRate {
+            source: vertical_rate_source,
+            sign: vertical_rate_sign,
+            value: vertical_rate_value,
+        };
+
+        // k
+        let turn_indicator = TurnIndicator(bytes[4] & 0b00000011);
+
+        // l
+        let altitude_difference_sign = if bytes[5] & 0b10000000 == 0 {
+            AltitudeDifferenceSign::GnssAboveBarometric
+        }
+        else {
+            AltitudeDifferenceSign::GnssBelowBarometric
+        };
+
+        // m
+        let m = bytes[5] & 0b01111111;
+        let altitude_difference_value = (m != 0).then(|| AltitudeDifferenceValue(m));
+
+        let altitude_difference = AltitudeDifference {
+            sign: altitude_difference_sign,
+            value: altitude_difference_value,
+        };
+
+        Ok(Self {
+            supersonic,
+            intent_change_flag,
+            ifr_capability_flag,
+            navigation_uncertainty_category,
+            velocity_type,
+            vertical_rate,
+            turn_indicator,
+            altitude_difference,
+        })
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VelocityType {
+    GroundSpeed(GroundSpeed),
+    Airspeed(Airspeed),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroundSpeed {
+    pub direction_east_west: DirectionEastWest,
+    pub velocity_east_west: Option<Velocity>,
+    pub direction_north_south: DirectionNorthSouth,
+    pub velocity_north_south: Option<Velocity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DirectionNorthSouth {
+    SouthToNorth,
+    NorthToSouth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DirectionEastWest {
+    WestToEast,
+    EastToWest,
+}
+
+/// A 10-bit velocity value.
+///
+/// This is used for east-west and north-south ground speed in [`GroundSpeed`]
+/// and for the airspeed in [`Airspeed`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Velocity(u16);
+
+impl Velocity {
+    pub const fn from_u16_unchecked(word: u16) -> Self {
+        Self(word)
+    }
+
+    pub const fn from_u16(word: u16) -> Option<Self> {
+        if word & 0b1111110000000000 == 0 && word != 0 {
+            Some(Self(word))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    pub fn as_knots(&self, supersonic: bool) -> u16 {
+        let v = self.0 - 1;
+        let v = if supersonic { v * 4 } else { v };
+        v
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Airspeed {
+    magnetic_heading: Option<MagneticHeading>,
+    airspeed_type: AirspeedType,
+    airspeed_value: Option<Velocity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MagneticHeading(u16);
+
+impl MagneticHeading {
+    pub const fn from_u16_unchecked(word: u16) -> Self {
+        Self(word)
+    }
+
+    pub const fn from_u16(word: u16) -> Option<Self> {
+        if word & 0b1111110000000000 == 0 {
+            Some(Self(word))
+        }
+        else {
+            None
+        }
+    }
+
+    /// The magnetic heading as 360/1024 of a degree
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    pub fn as_degrees(&self) -> f64 {
+        self.0 as f64 * 360.0 / 1024.0
+    }
+
+    pub fn as_radians(&self) -> f64 {
+        self.0 as f64 * TAU / 1024.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AirspeedType {
+    Indicated,
+    True,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VerticalRate {
+    pub source: VerticalRateSource,
+    pub sign: VerticalRateSign,
+    pub value: Option<VerticalRateValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VerticalRateSource {
+    Barometric,
+    Gnss,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VerticalRateSign {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VerticalRateValue(u16);
+
+impl VerticalRateValue {
+    pub const fn from_u16_unchecked(word: u16) -> Self {
+        Self(word)
+    }
+
+    pub const fn from_u16(word: u16) -> Option<Self> {
+        if word & 0b1111111000000000 == 0 && word != 0 {
+            Some(Self(word))
+        }
+        else {
+            None
+        }
+    }
+
+    /// The magnetic heading as 360/1024 of a degree
+    pub fn as_u16(&self) -> u16 {
+        self.0
+    }
+
+    pub fn as_ft_per_min(&self) -> u16 {
+        (self.0 - 1) * 64
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AltitudeDifferenceSign {
+    GnssAboveBarometric,
+    GnssBelowBarometric,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AltitudeDifferenceValue(u8);
+
+impl AltitudeDifferenceValue {
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b10000000 == 0 && byte != 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+
+    pub fn as_ft(&self) -> u8 {
+        (self.0 - 1) * 23
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AltitudeDifference {
+    pub sign: AltitudeDifferenceSign,
+    pub value: Option<AltitudeDifferenceValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NavigationUncertaintyCategory(u8);
+
+impl NavigationUncertaintyCategory {
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b11111000 == 0 && byte != 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+}
+
+
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TurnIndicator(u8);
+
+impl TurnIndicator {
+    pub const fn from_u8_unchecked(byte: u8) -> Self {
+        Self(byte)
+    }
+
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if byte & 0b11111000 == 0 && byte != 0 {
+            Some(Self(byte))
+        }
+        else {
+            None
+        }
+    }
+
+    pub fn as_u8(&self) -> u8 {
+        self.0
+    }
+}
+
+
+
+
+
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AircraftStatus {}
@@ -343,9 +720,9 @@ pub const CALLSIGN_ENCODING: &'static [u8] =
     b"#ABCDEFGHIJKLMNOPQRSTUVWXYZ##### ###############0123456789######";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GroundSpeed(u8);
+pub struct Movement(u8);
 
-impl GroundSpeed {
+impl Movement {
     pub const fn from_u8_unchecked(byte: u8) -> Self {
         Self(byte)
     }
@@ -363,6 +740,7 @@ impl GroundSpeed {
         self.0
     }
 
+    /// Decode movement in 1/8th knots
     pub fn decode_as_1_8th_kt(&self) -> Option<u32> {
         let q = GroundSpeedQuantization::from_encoded_value(self.0);
         match q {
@@ -378,12 +756,13 @@ impl GroundSpeed {
         }
     }
 
+    /// Decode movement in knots
     pub fn decode(&self) -> Option<f64> {
         self.decode_as_1_8th_kt().map(|speed| speed as f64 * 0.125)
     }
 }
 
-impl Debug for GroundSpeed {
+impl Debug for Movement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(kt) = self.decode() {
             write!(f, "GroundSpeed({} kt)", kt)
