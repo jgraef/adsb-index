@@ -147,7 +147,11 @@ async fn main() -> Result<(), Error> {
             frame_processor.finish();
         }
         Command::RtlSdr => {
-            let mut frame_processor = FrameProcessor::default();
+            let device_info = rtlsdr::usb::list_devices()?.next().expect("no device");
+            println!("{device_info:#?}");
+            device_info.open();
+
+            /*let mut frame_processor = FrameProcessor::default();
 
             //let mut rtl_adsb = rtl_tcp::RtlAdsbCommand::new().await?;
             let mut rtl_tcp = rtlsdr::tcp::RtlTcpClient::connect("localhost:1234").await?;
@@ -174,7 +178,7 @@ async fn main() -> Result<(), Error> {
                 }
             }
 
-            frame_processor.finish();
+            frame_processor.finish();*/
         }
     }
 

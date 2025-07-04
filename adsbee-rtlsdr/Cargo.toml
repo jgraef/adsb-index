@@ -12,6 +12,12 @@ thiserror = "2.0.12"
 tokio = { version = "1.46.0", default-features = false }
 hex = { version = "0.4.3", optional = true }
 tracing = "0.1.41"
+nusb = { version = "0.1.14", optional = true }
+derive_more = { version = "2.0.1", features = ["debug"], optional = true }
 
 [features]
+default = ["tcp", "usb"]
 command = ["tokio/process", "dep:hex"]
+tcp = ["tokio/net"]
+usb = ["dep:nusb", "dep:derive_more"]
+

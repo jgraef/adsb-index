@@ -1,7 +1,10 @@
 #[cfg(feature = "command")]
 pub mod command;
 pub mod demodulator;
+#[cfg(feature = "tcp")]
 pub mod tcp;
+#[cfg(feature = "usb")]
+pub mod usb;
 pub(crate) mod util;
 
 use std::{
