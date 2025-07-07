@@ -1,10 +1,11 @@
-mod bindings;
+//! 1090 MHz Mode-S demodulator
+//!
+//! <https://www.radartutorial.eu/13.ssr/sr24.en.html>
+//! <https://www.idc-online.com/technical_references/pdfs/electronic_engineering/Mode_S_Reply_Encoding.pdf>
+
 #[cfg(feature = "command")]
 pub mod command;
 pub mod demodulator;
-#[cfg(feature = "tcp")]
-pub mod tcp;
-pub(crate) mod util;
 
 use std::{
     fmt::Debug,
@@ -15,51 +16,36 @@ use std::{
     },
 };
 
-pub use bindings::{
+use futures_util::Stream;
+use pin_project_lite::pin_project;
+#[cfg(feature = "tcp")]
+pub use rtlsdr_async::rtl_tcp::client as rtl_tcp;
+pub use rtlsdr_async::{
+    AsyncReadSamples,
+    AsyncReadSamplesExt,
+    Configure,
     DeviceInfo,
     DeviceIter,
+    Error,
+    Gain,
+    IqSample,
     RtlSdr,
     devices,
 };
-use bytemuck::{
-    Pod,
-    Zeroable,
-};
-use pin_project_lite::pin_project;
 
-/// 16 bit IQ sample
-///
-/// 8 bits per component, mapped from [-128, 127] to [0, 255]
-#[derive(Clone, Copy, Pod, Zeroable)]
-#[repr(C)]
-pub struct IqSample {
-    /// I: in-phase / real component
-    pub i: u8,
-    /// Q: quadrature / imaginary component
-    pub q: u8,
-}
-
-impl Default for IqSample {
-    fn default() -> Self {
-        Self { i: 128, q: 128 }
+pub fn magnitude(sample: &IqSample) -> u16 {
+    #[inline(always)]
+    fn abs(x: u8) -> u8 {
+        if x >= 127 { x - 127 } else { 127 - x }
     }
-}
 
-impl IqSample {
-    pub fn magnitude(&self) -> u16 {
-        #[inline(always)]
-        fn abs(x: u8) -> u8 {
-            if x >= 127 { x - 127 } else { 127 - x }
-        }
-
-        #[inline(always)]
-        fn square(x: u8) -> u16 {
-            let x = u16::from(abs(x));
-            x * x
-        }
-
-        square(self.i) + square(self.q)
+    #[inline(always)]
+    fn square(x: u8) -> u16 {
+        let x = u16::from(abs(x));
+        x * x
     }
+
+    square(sample.i) + square(sample.q)
 }
 
 pub type Magnitude = u16;
@@ -87,263 +73,435 @@ impl<'a> Cursor<'a> {
     }
 }
 
-pub trait AsyncReadSamples {
-    type Error;
+/// Preamble: 8 µs / 16 samples
+const PREAMBLE_SAMPLES: usize = 16;
 
-    fn poll_read_samples(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut [IqSample],
-    ) -> Poll<Result<usize, Self::Error>>;
+/// Sample rate: 2 samples/µs
+pub const SAMPLE_RATE: u32 = 2_000_000;
+
+/// Mode S downlink frequency: 1090 MHz
+pub const DOWNLINK_FREQUENCY: u32 = 1_090_000_000;
+
+/// Mode S uplink frequency: 1030 MHz
+pub const UPLINK_FREQUENCY: u32 = 1_030_000_000;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Frame {
+    ModeAc { data: [u8; 2] },
+    ModeSShort { data: [u8; 7] },
+    ModeSLong { data: [u8; 14] },
 }
 
-impl<T: ?Sized + AsyncReadSamples + Unpin> AsyncReadSamples for &mut T {
-    type Error = <T as AsyncReadSamples>::Error;
-
-    fn poll_read_samples(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut [IqSample],
-    ) -> Poll<Result<usize, Self::Error>> {
-        Pin::new(&mut **self).poll_read_samples(cx, buffer)
-    }
-}
-
-pub trait AsyncReadSamplesExt: AsyncReadSamples {
-    fn read_samples<'a>(&'a mut self, buffer: &'a mut [IqSample]) -> ReadSamples<'a, Self>
-    where
-        Self: Unpin,
-    {
-        ReadSamples {
-            stream: self,
-            buffer,
-        }
-    }
-
-    fn map_err<E, F>(self, f: F) -> MapErr<Self, F>
-    where
-        F: FnMut(Self::Error) -> E,
-        Self: Sized,
-    {
-        MapErr {
-            inner: self,
-            map_err: f,
+impl AsRef<[u8]> for Frame {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Frame::ModeAc { data } => &data[..],
+            Frame::ModeSShort { data } => &data[..],
+            Frame::ModeSLong { data } => &data[..],
         }
     }
 }
 
-impl<T: AsyncReadSamples> AsyncReadSamplesExt for T {}
-
-pub struct ReadSamples<'a, S: ?Sized> {
-    stream: &'a mut S,
-    buffer: &'a mut [IqSample],
+enum DemodFail {
+    NotEnoughSamples,
+    Invalid,
 }
 
-impl<'a, 'b, S: AsyncReadSamples + Unpin + ?Sized> Future for ReadSamples<'a, S> {
-    type Output = Result<usize, S::Error>;
+#[derive(Debug)]
+pub struct Demodulator {
+    quality: Quality,
+    num_errors: usize,
+    max_errors: usize,
+}
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        Pin::new(&mut *this.stream).poll_read_samples(cx, this.buffer)
+impl Default for Demodulator {
+    fn default() -> Self {
+        Self::new(Default::default(), 5)
     }
+}
+
+impl Demodulator {
+    pub fn new(quality: Quality, max_errors: usize) -> Self {
+        Self {
+            quality,
+            num_errors: 0,
+            max_errors,
+        }
+    }
+
+    pub fn next(&mut self, cursor: &mut Cursor) -> Option<Frame> {
+        while find_preamble(cursor) {
+            //tracing::debug!(?cursor.position, "found preamble");
+
+            let mut frame_cursor = *cursor;
+
+            match self.read_frame(&mut frame_cursor) {
+                Ok(frame) => {
+                    // found a frame!
+                    // set main cursor to the position of the frame cursor
+                    cursor.position = frame_cursor.position;
+                    return Some(frame);
+                }
+                Err(DemodFail::NotEnoughSamples) => {
+                    // cursor position should remain at start of preamble
+                    return None;
+                }
+                Err(DemodFail::Invalid) => {
+                    // find next preamble starting from end of previous preamble
+                    // so the main cursor stays unchanged and we do nothing here
+                }
+            }
+        }
+
+        None
+    }
+
+    fn read_frame(&mut self, cursor: &mut Cursor) -> Result<Frame, DemodFail> {
+        self.num_errors = 0;
+
+        let first_byte = self.read_byte(cursor)?;
+
+        if first_byte & 0x80 == 0 {
+            Ok(Frame::ModeSShort {
+                data: self.read_frame_rest(first_byte, cursor)?,
+            })
+        }
+        else {
+            Ok(Frame::ModeSLong {
+                data: self.read_frame_rest(first_byte, cursor)?,
+            })
+        }
+    }
+
+    fn read_frame_rest<const N: usize>(
+        &mut self,
+        first_byte: u8,
+        cursor: &mut Cursor,
+    ) -> Result<[u8; N], DemodFail> {
+        let mut data = [0u8; N];
+        data[0] = first_byte;
+        for i in 1..N {
+            data[i] = self.read_byte(cursor)?;
+        }
+        Ok(data)
+    }
+
+    fn read_bit(&self, cursor: &mut Cursor) -> Result<bool, bool> {
+        // these should exist, since we read a preamble first
+        let a = cursor.samples[cursor.position - 2];
+        let b = cursor.samples[cursor.position - 1];
+
+        let c = cursor.samples[cursor.position];
+        let d = cursor.samples[cursor.position + 1];
+
+        cursor.advance(2);
+
+        let bit_p = a > b;
+        let bit = c > d;
+
+        // todo: this could be implemented with a few bitmask really
+
+        match self.quality {
+            Quality::NoChecks => Ok(bit),
+            Quality::HalfBit => {
+                if bit && bit_p && b > c {
+                    Err(bit)
+                }
+                else if !bit && !bit_p && b < c {
+                    Err(bit)
+                }
+                else {
+                    Ok(bit)
+                }
+            }
+            Quality::OneBit => {
+                if bit && bit_p && c > b {
+                    Ok(true)
+                }
+                else if bit && !bit_p && d < b {
+                    Ok(true)
+                }
+                else if !bit && bit_p && d > b {
+                    Ok(false)
+                }
+                else if !bit && !bit_p && c < b {
+                    Ok(false)
+                }
+                else {
+                    Err(bit)
+                }
+            }
+            Quality::TwoBits => {
+                if bit && bit_p && c > b && d < a {
+                    Ok(true)
+                }
+                else if bit && !bit_p && c > a && d < b {
+                    Ok(true)
+                }
+                else if !bit && bit_p && c < a && d > b {
+                    Ok(false)
+                }
+                else if !bit && !bit_p && c < b && d > a {
+                    Ok(false)
+                }
+                else {
+                    Err(bit)
+                }
+            }
+        }
+    }
+
+    fn read_byte(&mut self, cursor: &mut Cursor) -> Result<u8, DemodFail> {
+        let mut byte = 0;
+
+        if cursor.remaining().len() < 2 * 8 {
+            Err(DemodFail::NotEnoughSamples)
+        }
+        else {
+            for _ in 0..8 {
+                byte <<= 1;
+                let bit = self.read_bit(cursor).or_else(|bit| {
+                    self.num_errors += 1;
+                    if self.num_errors <= self.max_errors {
+                        Ok(bit)
+                    }
+                    else {
+                        // rtl_adsb.c does change the previous bits, but I don't get how that works.
+                        // Wouldn't that break the next bit reads?
+                        //
+                        // <https://github.com/rtlsdrblog/rtl-sdr-blog/blob/240bd0e1e6d9f64361b6949047468958cd08aa31/src/rtl_adsb.c#L300>
+                        Err(DemodFail::Invalid)
+                    }
+                })?;
+
+                if bit {
+                    byte |= 1;
+                }
+            }
+
+            Ok(byte)
+        }
+    }
+}
+
+fn is_preamble(samples: &[u16]) -> bool {
+    let mut low: u16 = 0;
+    let mut high: u16 = u16::MAX;
+
+    for i in 0..PREAMBLE_SAMPLES {
+        match i {
+            0 | 2 | 7 | 9 => {
+                high = samples[i];
+            }
+            _ => {
+                low = samples[i];
+            }
+        }
+
+        if high <= low {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn find_preamble(cursor: &mut Cursor) -> bool {
+    loop {
+        let remaining = cursor.remaining();
+        if remaining.len() >= PREAMBLE_SAMPLES {
+            if is_preamble(remaining) {
+                cursor.advance(PREAMBLE_SAMPLES);
+                break true;
+            }
+            cursor.advance(1);
+        }
+        else {
+            break false;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Quality {
+    NoChecks,
+    HalfBit,
+    #[default]
+    OneBit,
+    TwoBits,
 }
 
 pin_project! {
-    #[derive(Clone, Copy, Debug)]
-    pub struct MapErr<S, F> {
+    #[derive(Debug)]
+    pub struct DemodulateStream<S> {
         #[pin]
-        inner: S,
-        map_err: F,
+        stream: S,
+        demodulator: Demodulator,
+        buffer: Vec<Magnitude>,
+        read_pos: usize,
+        write_pos: usize,
+        num_samples: usize,
     }
 }
 
-impl<S, E, F> AsyncReadSamples for MapErr<S, F>
-where
-    S: AsyncReadSamples,
-    F: FnMut(S::Error) -> E,
-{
-    type Error = E;
-    fn poll_read_samples(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut [IqSample],
-    ) -> Poll<Result<usize, Self::Error>> {
-        let this = self.project();
-        this.inner
-            .poll_read_samples(cx, buffer)
-            .map_err(this.map_err)
+impl<S> DemodulateStream<S> {
+    pub fn new(stream: S, demodulator: Demodulator, buffer_size: usize) -> Self {
+        Self {
+            stream,
+            demodulator,
+            buffer: vec![0; buffer_size],
+            read_pos: 0,
+            write_pos: 0,
+            num_samples: 0,
+        }
     }
 }
 
-pub trait Configure {
-    type Error;
-
-    /// Set tuner frequency in Hz
-    fn set_center_frequency(
-        &mut self,
-        frequency: u32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    /// Set sample rate in Hz
-    fn set_sample_rate(
-        &mut self,
-        sample_rate: u32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    /// Set tuner gain, in tenths of a dB
-    fn set_tuner_gain(
-        &mut self,
-        gain: Gain,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    /// Set the automatic gain correction, a software step to correct the
-    /// incoming signal, this is not automatic gain control on the hardware
-    /// chip, that is controlled by tuner gain mode.
-    fn set_agc_mode(
-        &mut self,
-        enable: bool,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    fn set_frequency_correction(
-        &mut self,
-        ppm: i32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    fn set_tuner_if_gain(
-        &mut self,
-        stage: i16,
-        gain: i16,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    fn set_offset_tuning(
-        &mut self,
-        enable: bool,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    fn set_rtl_xtal(
-        &mut self,
-        frequency: u32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    fn set_tuner_xtal(
-        &mut self,
-        frequency: u32,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-
-    fn set_bias_tee(
-        &mut self,
-        enable: bool,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send + Sync;
-}
-
-impl<T: ?Sized + Unpin + Configure> Configure for &mut T {
-    type Error = <T as Configure>::Error;
-
-    fn set_center_frequency(
-        &mut self,
-        frequency: u32,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_center_frequency(*self, frequency)
-    }
-
-    fn set_sample_rate(
-        &mut self,
-        sample_rate: u32,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_sample_rate(*self, sample_rate)
-    }
-
-    fn set_tuner_gain(&mut self, gain: Gain) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_tuner_gain(*self, gain)
-    }
-
-    fn set_agc_mode(&mut self, enable: bool) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_agc_mode(*self, enable)
-    }
-
-    fn set_frequency_correction(
-        &mut self,
-        ppm: i32,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_frequency_correction(*self, ppm)
-    }
-
-    fn set_tuner_if_gain(
-        &mut self,
-        stage: i16,
-        gain: i16,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_tuner_if_gain(*self, stage, gain)
-    }
-
-    fn set_offset_tuning(&mut self, enable: bool) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_offset_tuning(*self, enable)
-    }
-
-    fn set_rtl_xtal(&mut self, frequency: u32) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_rtl_xtal(*self, frequency)
-    }
-
-    fn set_tuner_xtal(&mut self, frequency: u32) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_tuner_xtal(*self, frequency)
-    }
-
-    fn set_bias_tee(&mut self, enable: bool) -> impl Future<Output = Result<(), Self::Error>> {
-        T::set_bias_tee(*self, enable)
+impl<S: Configure> DemodulateStream<S> {
+    pub async fn configure(&mut self, frequency: Option<u32>) -> Result<(), S::Error> {
+        self.stream
+            .set_center_frequency(frequency.unwrap_or(DOWNLINK_FREQUENCY))
+            .await?;
+        self.stream.set_sample_rate(SAMPLE_RATE).await?;
+        self.stream.set_tuner_gain(Gain::Auto).await?;
+        self.stream.set_agc_mode(true).await?;
+        Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Gain {
-    /// Gain tenths of a dB
-    ManualValue(i32),
-    ManualIndex(usize),
-    /// Auto gain control
-    Auto,
-}
+impl<S: AsyncReadSamples> Stream for DemodulateStream<S> {
+    type Item = Result<Frame, S::Error>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TunerGainMode {
-    Manual,
-    Auto,
-}
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            let this = self.as_mut().project();
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DirectSamplingMode {
-    I,
-    Q,
-}
+            /*tracing::debug!(
+                read_pos = *this.read_pos,
+                write_pos = *this.write_pos,
+                num_samples = *this.num_samples
+            );*/
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TunerType(pub u32);
+            if *this.read_pos < *this.num_samples {
+                let mut cursor = Cursor {
+                    samples: &this.buffer[..*this.num_samples],
+                    position: *this.read_pos,
+                };
 
-impl TunerType {
-    pub const UNKNOWN: Self = Self(0);
-    pub const E4000: Self = Self(1);
-    pub const FC0012: Self = Self(2);
-    pub const FC0013: Self = Self(3);
-    pub const FC2580: Self = Self(4);
-    pub const R820T: Self = Self(5);
-    pub const R828D: Self = Self(6);
-}
+                if let Some(frame) = this.demodulator.next(&mut cursor) {
+                    *this.read_pos = cursor.position;
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                else {
+                    let position = cursor.position;
+                    this.buffer.copy_within(position..*this.num_samples, 0);
+                    *this.write_pos = *this.num_samples - position;
+                    *this.read_pos = 0;
+                    *this.num_samples = 0;
+                }
+            }
+            else {
+                let buffer = &mut this.buffer[*this.write_pos..];
 
-impl TunerType {
-    pub fn is_r82xx(&self) -> bool {
-        matches!(*self, TunerType::R828D | TunerType::R820T)
+                // we use the same buffer!
+                let iq_buffer: &mut [IqSample] = bytemuck::cast_slice_mut(buffer);
+
+                match this.stream.poll_read_samples(cx, iq_buffer) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
+                    Poll::Ready(Ok(num_samples)) => {
+                        if num_samples == 0 {
+                            return Poll::Ready(None);
+                        }
+
+                        magnitude_of_samples_inplace(&mut iq_buffer[..num_samples]);
+                        *this.num_samples = *this.write_pos + num_samples;
+                        *this.read_pos = 0;
+                        *this.write_pos = 0;
+                    }
+                }
+            }
+        }
     }
 }
 
-impl Debug for TunerType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::UNKNOWN => write!(f, "TunerType::UNKNOWN"),
-            Self::E4000 => write!(f, "TunerType::E4000"),
-            Self::FC0012 => write!(f, "TunerType::FC0012"),
-            Self::FC0013 => write!(f, "TunerType::FC0013"),
-            Self::FC2580 => write!(f, "TunerType::FC2580"),
-            Self::R820T => write!(f, "TunerType::R820T"),
-            Self::R828D => write!(f, "TunerType::R828D"),
-            _ => write!(f, "TunerType({})", self.0),
+/// computes magnitudes of samples and replaces samples inplace with u16 of
+/// magnitude
+fn magnitude_of_samples_inplace(samples: &mut [IqSample]) {
+    // todo: is this fast?
+    // if not, we can just remove [`Sample`] and use u16. a custom magnitude
+    // function will take care of it.
+    for sample in samples.iter_mut() {
+        let magnitude = magnitude(&sample);
+        *sample = bytemuck::cast(magnitude);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Cursor,
+        Demodulator,
+        Frame,
+        Quality,
+    };
+
+    fn modulate(data: &[u8], mut sample: impl FnMut(bool) -> u16) -> Vec<u16> {
+        let mut samples = vec![];
+
+        // 0, 2, 7, 9 are high
+        let mut preamble: u16 = 0b1010_0001_0100_0000;
+        for _ in 0..16 {
+            if preamble & 0x8000 == 0 {
+                samples.push(sample(false));
+            }
+            else {
+                samples.push(sample(true));
+            }
+            preamble <<= 1;
+        }
+
+        for mut byte in data.iter().copied() {
+            for _ in 0..8 {
+                if byte & 0x80 == 0 {
+                    // bit=0 raising edge
+                    samples.push(sample(false));
+                    samples.push(sample(true));
+                }
+                else {
+                    // bit=1 falling edge
+                    samples.push(sample(true));
+                    samples.push(sample(false));
+                }
+                byte <<= 1;
+            }
+        }
+
+        samples
+    }
+
+    fn best_signal(signal: bool) -> u16 {
+        if signal { u16::MAX } else { 0 }
+    }
+
+    #[test]
+    fn it_demodulates_a_frame() {
+        let input = b"\x8d\x40\x74\xb5\x23\x15\xa6\x76\xdd\x13\xa0\x66\x29\x67";
+
+        let samples = modulate(input, best_signal);
+
+        let mut demodulator = Demodulator::new(Quality::NoChecks, 0);
+        let mut cursor = Cursor {
+            samples: &samples[..],
+            position: 0,
+        };
+
+        let frame = demodulator.next(&mut cursor).expect("no frame demodulated");
+        match frame {
+            Frame::ModeSLong { data } => {
+                assert_eq!(&data, input);
+            }
+            _ => panic!("unexpected frame: {:?}", frame),
         }
     }
 }

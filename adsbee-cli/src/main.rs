@@ -31,21 +31,7 @@ use adsbee_api_types::{
 };
 use adsbee_beast as beast;
 use adsbee_mode_s as mode_s;
-use adsbee_rtlsdr::{
-    AsyncReadSamples,
-    Configure,
-    RtlSdr,
-    demodulator::{
-        self,
-        DemodulateStream,
-        Demodulator,
-        Quality,
-    },
-    tcp::{
-        client::RtlTcpClient,
-        server::RtlSdrServer,
-    },
-};
+use adsbee_rtlsdr as rtlsdr;
 use adsbee_sbs as sbs;
 use adsbee_types::{
     IcaoAddress,
@@ -74,10 +60,7 @@ use tokio::{
         AsyncRead,
         BufReader,
     },
-    net::{
-        TcpListener,
-        TcpStream,
-    },
+    net::TcpStream,
 };
 use uuid::Uuid;
 
@@ -198,27 +181,28 @@ async fn main() -> Result<(), Error> {
                     bail!("Both --address and --device set. Either one must be used.");
                 }
 
-                let rtl_tcp = RtlTcpClient::connect(&address).await?;
+                let rtl_tcp = rtlsdr::rtl_tcp::RtlTcpClient::connect(&address).await?;
                 println!("{:#?}", rtl_tcp.dongle_info());
 
                 run_rtl_sdr(rtl_tcp, frequency, dump_file).await?;
             }
             else {
-                let rtl_sdr = RtlSdr::open(device.unwrap_or_default().try_into().unwrap())?;
+                let rtl_sdr = rtlsdr::RtlSdr::open(device.unwrap_or_default().try_into().unwrap())?;
                 run_rtl_sdr(rtl_sdr, frequency, dump_file).await?;
             }
 
-            async fn run_rtl_sdr<S: AsyncReadSamples + Configure + Unpin>(
+            async fn run_rtl_sdr<S: rtlsdr::AsyncReadSamples + rtlsdr::Configure + Unpin>(
                 rtl_sdr: S,
                 frequency: Option<u32>,
                 mut dump_file: impl FnMut(u8, &[u8]) -> Result<(), Error>,
             ) -> Result<(), Error>
             where
-                Error: From<<S as AsyncReadSamples>::Error> + From<<S as Configure>::Error>,
+                Error: From<<S as rtlsdr::AsyncReadSamples>::Error>
+                    + From<<S as rtlsdr::Configure>::Error>,
             {
-                let mut rtl_adsb = DemodulateStream::new(
+                let mut rtl_adsb = rtlsdr::DemodulateStream::new(
                     rtl_sdr,
-                    Demodulator::new(Quality::NoChecks, 5),
+                    rtlsdr::Demodulator::new(rtlsdr::Quality::NoChecks, 5),
                     0x800000,
                 );
                 rtl_adsb.configure(frequency).await?;
@@ -227,13 +211,13 @@ async fn main() -> Result<(), Error> {
 
                 while let Some(data) = rtl_adsb.try_next().await? {
                     match data {
-                        demodulator::Frame::ModeAc { data } => todo!("mode ac: {data:?}"),
-                        demodulator::Frame::ModeSShort { data } => {
+                        rtlsdr::Frame::ModeAc { data } => todo!("mode ac: {data:?}"),
+                        rtlsdr::Frame::ModeSShort { data } => {
                             if frame_processor.handle_mode_s_data(&data) {
                                 dump_file(7, &data)?;
                             }
                         }
-                        demodulator::Frame::ModeSLong { data } => {
+                        rtlsdr::Frame::ModeSLong { data } => {
                             if frame_processor.handle_mode_s_data(&data) {
                                 dump_file(14, &data)?;
                             }
@@ -244,13 +228,6 @@ async fn main() -> Result<(), Error> {
                 frame_processor.finish();
                 Ok(())
             }
-        }
-        Command::RtlSdrServer { device, address } => {
-            let rtl_sdr = RtlSdr::open(device.unwrap_or_default().try_into().unwrap())?;
-            let tcp_listener = TcpListener::bind(address).await?;
-            RtlSdrServer::from_rtl_sdr(rtl_sdr, tcp_listener)
-                .serve()
-                .await?;
         }
     }
 
@@ -317,15 +294,6 @@ enum Command {
         /// in Hz. Default: 1090Mhz
         #[clap(short, long)]
         frequency: Option<u32>,
-    },
-    RtlSdrServer {
-        /// Device index
-        ///
-        /// Defaults to using the first.
-        #[clap(short, long)]
-        device: Option<usize>,
-
-        address: String,
     },
 }
 
